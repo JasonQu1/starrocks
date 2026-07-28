@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "compute_env/query/partition_scan_range_pruner.h"
 #include "exec/pipeline/pipeline_builder.h"
 #include "exec/pipeline/scan/scan_operator.h"
 
@@ -72,9 +73,13 @@ protected:
     bool has_shared_chunk_source() const override;
     BalancedChunkBuffer& get_chunk_buffer() const override;
     bool need_notify_all() override;
+    StatusOr<bool> _before_chunk_source_start(RuntimeState* state, ChunkSource* chunk_source) override;
 
 private:
     OlapScanContextPtr _ctx;
+    RuntimeFilterPartitionPruner _partition_pruner;
+    RuntimeProfile::Counter* _runtime_filter_partition_prune_evaluations = nullptr;
+    RuntimeProfile::Counter* _runtime_filter_pruned_scan_ranges = nullptr;
 };
 
 } // namespace pipeline

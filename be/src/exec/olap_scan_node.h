@@ -23,6 +23,7 @@
 #include "column/chunk.h"
 #include "column/column_access_path.h"
 #include "common/statusor.h"
+#include "compute_env/query/partition_scan_range_pruner.h"
 #include "compute_env/query/scan_conjuncts_manager.h"
 #include "exec/scan_node.h"
 #include "exec/tablet_scanner.h"
@@ -83,6 +84,9 @@ public:
     StatusOr<pipeline::OpFactories> decompose_to_pipeline(pipeline::PipelineBuilderContext* context) override;
 
     const TOlapScanNode& thrift_olap_scan_node() const { return _olap_scan_node; }
+    const RuntimeFilterPartitionBoundaryMap& runtime_filter_partition_boundaries() const {
+        return _runtime_filter_partition_boundaries;
+    }
 
     int estimated_max_concurrent_chunks() const;
 
@@ -170,6 +174,7 @@ private:
 
 private:
     TOlapScanNode _olap_scan_node;
+    RuntimeFilterPartitionBoundaryMap _runtime_filter_partition_boundaries;
     std::vector<std::unique_ptr<TInternalScanRange>> _scan_ranges;
     TupleDescriptor* _tuple_desc = nullptr;
     std::unique_ptr<ScanConjunctsManager> _conjuncts_manager = nullptr;

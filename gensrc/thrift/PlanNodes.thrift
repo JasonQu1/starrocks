@@ -676,6 +676,24 @@ struct TTableSampleOptions {
   5: optional double probability_percent_v2; // new field; can carry sub-1% values such as 0.5, takes precedence when set
 }
 
+enum TPartitionBoundaryType {
+  LIST,
+  RANGE,
+}
+
+// Projection of one physical partition onto one eligible partition slot.
+struct TPartitionBoundary {
+  1: required i64 partition_id
+  2: required Types.TSlotId slot_id
+  3: required TPartitionBoundaryType boundary_type
+  4: optional list<Exprs.TExpr> list_values
+  5: optional Exprs.TExpr range_lower // inclusive; absent means unbounded
+  6: optional Exprs.TExpr range_upper // exclusive; absent means unbounded
+  7: optional bool contains_null = false
+  // Multi-column RANGE projection can include the first-column upper value.
+  8: optional bool range_upper_inclusive = false
+}
+
 // If you find yourself changing this struct, see also TLakeScanNode
 struct TOlapScanNode {
   1: required Types.TTupleId tuple_id
@@ -727,6 +745,8 @@ struct TOlapScanNode {
   56: optional bool enable_global_late_materialization
 
   57: optional list<Exprs.TExpr> partition_conjuncts
+
+  59: optional list<TPartitionBoundary> partition_boundaries
 }
 
 struct TJDBCScanNode {
@@ -789,6 +809,8 @@ struct TLakeScanNode {
   62: optional bool use_prepared_physical_split_scan
 
   63: optional TTableSampleOptions sample_options
+
+  64: optional list<TPartitionBoundary> partition_boundaries
 }
 
 struct TEqJoinCondition {

@@ -68,6 +68,7 @@ public:
         }
         return _runtime_filter_collector->get_rf_probe_collector();
     }
+    const std::vector<ExprContext*>& get_instance_runtime_in_filters() const { return _runtime_in_filters; }
 
     const std::vector<SlotId>& get_filter_null_value_columns() const override { return _filter_null_value_columns; }
 

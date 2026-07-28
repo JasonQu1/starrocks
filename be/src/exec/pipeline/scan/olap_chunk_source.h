@@ -50,6 +50,9 @@ public:
     Status prepare(RuntimeState* state) override;
     void close(RuntimeState* state) override;
     void update_chunk_exec_stats(RuntimeState* state) override;
+    bool has_partition_id() const { return _scan_range->__isset.partition_id; }
+    int64_t partition_id() const { return _scan_range->partition_id; }
+    void set_partition_pruned() { _partition_pruned = true; }
 
 private:
     Status _read_chunk(RuntimeState* state, ChunkPtr* chunk) override;
@@ -209,6 +212,8 @@ private:
 
     // FlatJSON
     RuntimeProfile::Counter* _pushdown_access_paths_counter = nullptr;
+
+    bool _partition_pruned = false;
 };
 } // namespace pipeline
 } // namespace starrocks

@@ -624,17 +624,19 @@ Status ScanOperator::_trigger_next_scan(RuntimeState* state, int chunk_source_in
             int64_t prev_scan_rows = chunk_source->get_scan_rows();
             int64_t prev_scan_bytes = chunk_source->get_scan_bytes();
 
-            // kick start this chunk source
-            auto start_status = chunk_source->start(state);
-            if (!start_status.ok()) {
-                LOG(WARNING) << "start chunk_source failed, fragment_instance_id="
-                             << print_id(state->fragment_instance_id()) << ", error=" << start_status.to_string();
-                _set_scan_status(start_status);
-            }
-            Status status;
-
-            if (start_status.ok()) {
-                status = chunk_source->buffer_next_batch_chunks_blocking(state, kIOTaskBatchSize, _workgroup.get());
+            auto skip_start = _before_chunk_source_start(state, chunk_source.get());
+            Status status = skip_start.status();
+            if (status.ok()) {
+                if (!skip_start.value()) {
+                    status = chunk_source->start(state);
+                    if (!status.ok()) {
+                        LOG(WARNING) << "start chunk_source failed, fragment_instance_id="
+                                     << print_id(state->fragment_instance_id()) << ", error=" << status.to_string();
+                    }
+                }
+                if (status.ok()) {
+                    status = chunk_source->buffer_next_batch_chunks_blocking(state, kIOTaskBatchSize, _workgroup.get());
+                }
             }
 
             if (!status.ok() && !status.is_end_of_file()) {

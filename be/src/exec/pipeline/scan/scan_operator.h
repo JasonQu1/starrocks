@@ -158,6 +158,7 @@ protected:
             chunk_source->close(state);
         }
     }
+    virtual StatusOr<bool> _before_chunk_source_start(RuntimeState*, ChunkSource*) { return false; }
 
     virtual BalancedChunkBuffer& get_chunk_buffer() const = 0;
 

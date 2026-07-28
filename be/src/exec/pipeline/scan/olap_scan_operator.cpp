@@ -98,6 +98,9 @@ bool OlapScanOperator::is_finished() const {
 Status OlapScanOperator::do_prepare(RuntimeState* state) {
     bool shared_scan = _ctx->is_shared_scan();
     _unique_metrics->add_info_string("SharedScan", shared_scan ? "True" : "False");
+    _runtime_filter_partition_prune_evaluations =
+            ADD_COUNTER(_unique_metrics, "RuntimeFilterPartitionPruneEvaluations", TUnit::UNIT);
+    _runtime_filter_pruned_scan_ranges = ADD_COUNTER(_unique_metrics, "RuntimeFilterPrunedScanRanges", TUnit::UNIT);
     _ctx->attach_observer(state, observer());
     return Status::OK();
 }
@@ -137,6 +140,23 @@ bool OlapScanOperator::need_notify_all() {
     // produced chunk is handled by a targeted notify in ChunkSource (see
     // ScanOperator::notify_chunk_buffer_consumer), so this stays a rare edge event.
     return (!_ctx->only_one_observer() && _ctx->active_inputs_empty_event()) || has_full_events();
+}
+
+StatusOr<bool> OlapScanOperator::_before_chunk_source_start(RuntimeState*, ChunkSource* chunk_source) {
+    auto* olap_scan_node = down_cast<OlapScanNode*>(_scan_node);
+    auto result = _partition_pruner.update(olap_scan_node->runtime_filter_partition_boundaries(),
+                                           get_factory()->get_instance_runtime_in_filters(),
+                                           get_factory()->get_runtime_bloom_filters(), _driver_sequence);
+    COUNTER_UPDATE(_runtime_filter_partition_prune_evaluations, result.evaluations);
+
+    auto* olap_chunk_source = down_cast<OlapChunkSource*>(chunk_source);
+    if (olap_chunk_source->has_partition_id() &&
+        _partition_pruner.is_partition_pruned(olap_chunk_source->partition_id())) {
+        olap_chunk_source->set_partition_pruned();
+        COUNTER_UPDATE(_runtime_filter_pruned_scan_ranges, 1);
+        return true;
+    }
+    return false;
 }
 
 std::string OlapScanOperator::get_name() const {

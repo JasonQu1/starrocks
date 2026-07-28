@@ -51,6 +51,7 @@ import com.starrocks.catalog.ExpressionRangePartitionInfoV2;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.LocalTablet;
+import com.starrocks.catalog.ListPartitionInfo;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
@@ -105,6 +106,7 @@ import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeCommon;
 import com.starrocks.thrift.TPlanNodeType;
 import com.starrocks.thrift.TPrimitiveType;
+import com.starrocks.thrift.TPartitionBoundary;
 import com.starrocks.thrift.TScanRange;
 import com.starrocks.thrift.TScanRangeLocation;
 import com.starrocks.thrift.TScanRangeLocations;
@@ -1145,6 +1147,12 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
         }
 
         assignOrderByHints(keyColumnNames);
+        Set<SlotRef> partitionColumnProbeSlots = collectPartitionColumnProbeSlots();
+        List<TPartitionBoundary> partitionBoundaries =
+                RuntimeFilterPartitionBoundaryBuilder.build(
+                        olapTable, selectedPartitionIds, partitionColumnProbeSlots,
+                        ConnectContext.get().getSessionVariable().getDynamicPartitionPruneValuesLimit());
+
         if (olapTable.isCloudNativeTableOrMaterializedView()) {
             msg.node_type = TPlanNodeType.LAKE_SCAN_NODE;
             msg.lake_scan_node =
@@ -1216,6 +1224,9 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
             msg.lake_scan_node.setSchema_key(getSchemaKey());
 
             msg.lake_scan_node.setPartition_conjuncts(ExprToThrift.treesToThrift(partitionConjuncts));
+            if (!partitionBoundaries.isEmpty()) {
+                msg.lake_scan_node.setPartition_boundaries(partitionBoundaries);
+            }
         } else { // If you find yourself changing this code block, see also the above code block
             msg.node_type = TPlanNodeType.OLAP_SCAN_NODE;
             msg.olap_scan_node =
@@ -1287,6 +1298,9 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
                 sample.toThrift(sampleOptions);
             }
             msg.olap_scan_node.setPartition_conjuncts(ExprToThrift.treesToThrift(partitionConjuncts));
+            if (!partitionBoundaries.isEmpty()) {
+                msg.olap_scan_node.setPartition_boundaries(partitionBoundaries);
+            }
         }
     }
 
@@ -1828,5 +1842,31 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
             }
         }
         return accept;
+    }
+
+    private Set<SlotRef> collectPartitionColumnProbeSlots() {
+        Set<SlotRef> probeSlots = Sets.newLinkedHashSet();
+        if (!ConnectContext.get().getSessionVariable().isEnableRuntimeFilterPartitionPrune()) {
+            return probeSlots;
+        }
+        PartitionInfo partitionInfo = olapTable.getPartitionInfo();
+        if (!(partitionInfo instanceof RangePartitionInfo) && !(partitionInfo instanceof ListPartitionInfo)) {
+            return probeSlots;
+        }
+        List<Column> partitionColumns = partitionInfo.getPartitionColumns(olapTable.getIdToColumn());
+        for (RuntimeFilterDescription description : probeRuntimeFilters) {
+            Expr probeExpr = description.getNodeIdToProbeExpr().get(getId().asInt());
+            if (description.runtimeFilterType() != RuntimeFilterDescription.RuntimeFilterType.JOIN_FILTER
+                    || !(probeExpr instanceof SlotRef slotRef)) {
+                continue;
+            }
+            Column probeColumn = slotRef.getColumn();
+            boolean eligible = probeColumn != null && partitionColumns.stream()
+                    .anyMatch(column -> column.getColumnId().equals(probeColumn.getColumnId()));
+            if (eligible) {
+                probeSlots.add(slotRef);
+            }
+        }
+        return probeSlots;
     }
 }

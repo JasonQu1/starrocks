@@ -129,6 +129,9 @@ Status OlapChunkSource::prepare(RuntimeState* state) {
 }
 
 void OlapChunkSource::update_chunk_exec_stats(RuntimeState* state) {
+    if (_reader == nullptr) {
+        return;
+    }
     if (auto* query_runtime_state = state == nullptr ? nullptr : state->query_runtime_state();
         query_runtime_state != nullptr) {
         int32_t node_id = _scan_op->get_plan_node_id();
@@ -649,6 +652,10 @@ Status OlapChunkSource::_init_olap_reader(RuntimeState* runtime_state) {
 }
 
 Status OlapChunkSource::_read_chunk(RuntimeState* state, ChunkPtr* chunk) {
+    if (_partition_pruned) {
+        return Status::EndOfFile("partition pruned by runtime filter");
+    }
+
     ASSIGN_OR_RETURN(auto chunk_ptr, RuntimeChunkHelper::new_chunk_pooled_checked(_prj_iter->output_schema(),
                                                                                   _runtime_state->chunk_size()));
     chunk->reset(chunk_ptr);

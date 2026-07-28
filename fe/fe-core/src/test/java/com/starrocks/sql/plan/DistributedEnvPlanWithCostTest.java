@@ -34,6 +34,9 @@ import com.starrocks.sql.optimizer.rule.transformation.DeriveRangeJoinPredicateR
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TKeyRange;
+import com.starrocks.thrift.TPartitionBoundary;
+import com.starrocks.thrift.TPartitionBoundaryType;
+import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
@@ -54,6 +57,19 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         FeConstants.runningUnitTest = true;
         Config.tablet_sched_disable_colocate_overall_balance = true;
         connectContext.getSessionVariable().setEnableRewriteSimpleAggToMetaScan(false);
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_list (\n" +
+                "    id bigint,\n" +
+                "    dt varchar(20) not null,\n" +
+                "    province varchar(20) not null\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(id)\n" +
+                "PARTITION BY LIST (dt, province) (\n" +
+                "    PARTITION p1 VALUES IN ((\"2022-04-01\", \"beijing\"), " +
+                "(\"2022-04-01\", \"chongqing\")),\n" +
+                "    PARTITION p2 VALUES IN ((\"2022-04-02\", \"beijing\"))\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(id) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
     }
 
     @AfterEach
@@ -1810,5 +1826,72 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         Assertions.assertEquals(19920101, keyRange.get(0).begin_key);
         Assertions.assertEquals(19930101, keyRange.get(0).end_key);
         Assertions.assertEquals(1, scanNodes.getPartitionConjuncts().size());
+    }
+
+    @Test
+    public void testRuntimeFilterPartitionBoundariesRequireSessionGate() throws Exception {
+        String sql = "select count(1) from lineitem_partition a join[broadcast] "
+                + "lineitem_partition_colocate b on a.L_SHIPDATE = b.L_SHIPDATE";
+
+        List<TPlanNode> disabledProbeScans = serializedOlapProbeScans(getExecPlan(sql));
+        Assertions.assertFalse(disabledProbeScans.isEmpty());
+        Assertions.assertTrue(disabledProbeScans.stream()
+                .noneMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()));
+
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            List<TPlanNode> enabledProbeScans = serializedOlapProbeScans(getExecPlan(sql));
+            Assertions.assertTrue(enabledProbeScans.stream().anyMatch(node ->
+                    node.getOlap_scan_node().isSetPartition_boundaries()
+                            && !node.getOlap_scan_node().getPartition_boundaries().isEmpty()));
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    @Test
+    public void testListRuntimeFilterPartitionBoundaryLimitIsPerSlot() throws Exception {
+        String sql = "select count(1) from rf_partition_prune_list a join[broadcast] "
+                + "rf_partition_prune_list b on a.dt = b.dt and a.province = b.province";
+
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true,"
+                            + "\"dynamic_partition_prune_limit\":1}");
+            List<TPartitionBoundary> boundaries =
+                    serializedOlapProbeScans(getExecPlan(sql)).stream()
+                            .filter(node -> node.getOlap_scan_node().isSetPartition_boundaries())
+                            .flatMap(node -> node.getOlap_scan_node()
+                                    .getPartition_boundaries().stream())
+                            .collect(Collectors.toList());
+
+            Assertions.assertFalse(boundaries.isEmpty());
+            Assertions.assertTrue(boundaries.stream().allMatch(boundary ->
+                    boundary.getBoundary_type() == TPartitionBoundaryType.LIST
+                            && boundary.getList_valuesSize() == 1));
+            List<Long> boundariesPerSlot = boundaries.stream()
+                    .collect(Collectors.groupingBy(
+                            TPartitionBoundary::getSlot_id,
+                            Collectors.counting()))
+                    .values().stream().sorted().collect(Collectors.toList());
+            // p1.dt deduplicates to one value and survives the limit. p1.province
+            // exceeds the limit and is omitted without affecting the dt boundary.
+            Assertions.assertEquals(List.of(1L, 2L), boundariesPerSlot);
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false,"
+                            + "\"dynamic_partition_prune_limit\":4096}");
+        }
+    }
+
+    private List<TPlanNode> serializedOlapProbeScans(ExecPlan plan) {
+        return plan.getFragments().stream()
+                .flatMap(fragment -> fragment.toThrift().getPlan().getNodes().stream())
+                .filter(TPlanNode::isSetOlap_scan_node)
+                .filter(node -> node.isSetProbe_runtime_filters()
+                        && !node.getProbe_runtime_filters().isEmpty())
+                .collect(Collectors.toList());
     }
 }
