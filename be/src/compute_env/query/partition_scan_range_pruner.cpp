@@ -14,42 +14,57 @@
 
 #include "compute_env/query/partition_scan_range_pruner.h"
 
+#include <algorithm>
+
 #include "column/column_helper.h"
+#include "column/column_viewer.h"
 #include "column/runtime_type_traits.h"
 #include "common/object_pool.h"
 #include "compute_env/runtime_range_pruner.hpp"
+#include "exec_primitive/runtime_filter/runtime_filter_probe.h"
+#include "exprs/column_ref.h"
 #include "exprs/expr.h"
 #include "exprs/expr_executor.h"
 #include "exprs/expr_factory.h"
+#include "exprs/in_const_predicate.hpp"
+#include "runtime/runtime_filter.h"
 #include "runtime/runtime_state.h"
 #include "types/date_value.h"
 #include "types/logical_type.h"
+#include "types/logical_type_infra.h"
 
 namespace starrocks {
+
+// Materialize constant literal expressions into a column of the slot's type.
+static StatusOr<ColumnPtr> build_partition_literal_values(const SlotDescriptor* slot_desc,
+                                                          const std::vector<TExpr>& literals, ObjectPool* obj_pool,
+                                                          RuntimeState* state) {
+    std::vector<ExprContext*> ctxs;
+    for (const auto& obj : literals) {
+        RETURN_IF_ERROR(ExprFactory::create_expr_tree(obj_pool, obj, &ctxs.emplace_back(), state));
+        DCHECK(ctxs.back()->root()->is_constant());
+    }
+    RETURN_IF_ERROR(ExprExecutor::prepare(ctxs, state));
+    RETURN_IF_ERROR(ExprExecutor::open(ctxs, state));
+
+    auto col = ColumnHelper::create_column(slot_desc->type(), true);
+    for (auto* ctx : ctxs) {
+        ASSIGN_OR_RETURN(ColumnPtr v, ctx->root()->evaluate_const(ctx));
+        if (v->only_null()) {
+            col->append_nulls(1);
+            continue;
+        }
+        auto cv = ColumnHelper::unpack_and_duplicate_const_column(1, v);
+        col->append(*cv, 0, 1);
+    }
+    ExprExecutor::close(ctxs, state);
+    return col;
+}
 
 StatusOr<ColumnPtr> build_partition_col_values(const SlotDescriptor* slot_desc, const TKeyRange& column_range,
                                                ObjectPool* obj_pool, RuntimeState* state) {
     if (column_range.__isset.list_values && !column_range.list_values.empty()) {
-        std::vector<ExprContext*> ctxs;
-        for (const auto& obj : column_range.list_values) {
-            RETURN_IF_ERROR(ExprFactory::create_expr_tree(obj_pool, obj, &ctxs.emplace_back(), state));
-            DCHECK(ctxs.back()->root()->is_constant());
-        }
-        RETURN_IF_ERROR(ExprExecutor::prepare(ctxs, state));
-        RETURN_IF_ERROR(ExprExecutor::open(ctxs, state));
-
-        auto col = ColumnHelper::create_column(slot_desc->type(), true, false, column_range.list_values.size(), false);
-        for (auto* ctx : ctxs) {
-            ASSIGN_OR_RETURN(ColumnPtr v, ctx->root()->evaluate_const(ctx));
-            if (v->only_null()) {
-                col->append_nulls(1);
-                continue;
-            }
-            auto cv = ColumnHelper::unpack_and_duplicate_const_column(1, v);
-            col->append(*cv, 0, 1);
-        }
-        ExprExecutor::close(ctxs, state);
-        return col;
+        return build_partition_literal_values(slot_desc, column_range.list_values, obj_pool, state);
     } else if (column_range.__isset.begin_key && column_range.__isset.end_key) {
         if (slot_desc->type().is_date_type()) {
             auto lower_julian = date::from_date_literal(column_range.begin_key);
@@ -161,4 +176,257 @@ Status prune_scan_ranges_by_partition_conjuncts(RuntimeState* state, const Tuple
     return Status::OK();
 }
 
+RuntimeFilterPartitionBoundaryMap parse_partition_boundaries(const TupleDescriptor* tuple_desc,
+                                                             const std::vector<TPartitionBoundary>& thrift_boundaries,
+                                                             RuntimeState* state) {
+    RuntimeFilterPartitionBoundaryMap boundaries;
+    ObjectPool pool;
+    for (const auto& thrift_boundary : thrift_boundaries) {
+        auto* slot = tuple_desc->get_slot_by_id(thrift_boundary.slot_id);
+        if (slot == nullptr) {
+            continue;
+        }
+
+        RuntimeFilterPartitionBoundary boundary;
+        boundary.physical_partition_ids = thrift_boundary.physical_partition_ids;
+        boundary.slot_id = thrift_boundary.slot_id;
+        boundary.column_type = slot->type();
+        boundary.contains_null = thrift_boundary.contains_null;
+        boundary.upper_bound_closed = thrift_boundary.range_upper_closed;
+        // LIST when list_values is set, otherwise RANGE.
+        if (thrift_boundary.__isset.list_values) {
+            auto values = build_partition_literal_values(slot, thrift_boundary.list_values, &pool, state);
+            if (!values.ok()) {
+                continue;
+            }
+            boundary.list_values = std::move(values).value();
+        } else {
+            if (thrift_boundary.__isset.range_lower) {
+                auto lower = build_partition_literal_values(slot, {thrift_boundary.range_lower}, &pool, state);
+                if (!lower.ok()) {
+                    continue;
+                }
+                boundary.lower_bound = std::move(lower).value();
+            }
+            if (thrift_boundary.__isset.range_upper) {
+                auto upper = build_partition_literal_values(slot, {thrift_boundary.range_upper}, &pool, state);
+                if (!upper.ok()) {
+                    continue;
+                }
+                boundary.upper_bound = std::move(upper).value();
+            }
+        }
+        boundaries[boundary.slot_id].emplace_back(std::move(boundary));
+    }
+    return boundaries;
+}
+
+static bool parse_join_runtime_in_filter(const Expr& root, ColumnPtr* values, bool* matches_null) {
+    // The join build side instantiates the predicate on the probe slot's own type (no CHAR->VARCHAR
+    // mapping, unlike the static IN factory), so the cast target must follow that type exactly.
+    return type_dispatch_filter(root.get_child(0)->type().type, false, [&]<LogicalType LT>() {
+        const auto* predicate = dynamic_cast<const VectorizedInConstPredicate<LT>*>(&root);
+        if (predicate == nullptr || !predicate->is_join_runtime_filter()) {
+            return false;
+        }
+        *values = predicate->get_all_values();
+        *matches_null = predicate->null_in_set() && predicate->is_eq_null();
+        return true;
+    });
+}
+
+RuntimeFilterPartitionPruner::RuntimeFilterPartitionPruner(RuntimeFilterPartitionBoundaryMap boundaries)
+        : _boundaries(std::move(boundaries)) {
+    // Boundaries of different partition columns may name the same physical partition; count each once.
+    std::unordered_set<int64_t> partition_ids;
+    for (const auto& [slot_id, slot_boundaries] : _boundaries) {
+        for (const auto& boundary : slot_boundaries) {
+            partition_ids.insert(boundary.physical_partition_ids.begin(), boundary.physical_partition_ids.end());
+        }
+    }
+    _candidate_partition_count = static_cast<int64_t>(partition_ids.size());
+}
+
+int64_t RuntimeFilterPartitionPruner::publish_pruned_partitions(const PrunedPartitions& current,
+                                                                const PrunedPartitions& newly_pruned_partitions) {
+    if (newly_pruned_partitions.empty()) {
+        return 0;
+    }
+    auto published = std::make_shared<PrunedPartitions>(current);
+    published->insert(newly_pruned_partitions.begin(), newly_pruned_partitions.end());
+    const int64_t newly_pruned_count = static_cast<int64_t>(published->size() - current.size());
+    const bool all_pruned = published->size() == _candidate_partition_count;
+    _pruned_partitions.store(std::move(published), std::memory_order_release);
+    if (all_pruned) {
+        // Publish completion after the snapshot.
+        _bloom_pruning_complete.store(true, std::memory_order_release);
+    }
+    return newly_pruned_count;
+}
+
+int64_t RuntimeFilterPartitionPruner::prune_by_in_filters(const std::vector<ExprContext*>& runtime_in_filters) {
+    std::lock_guard<std::mutex> update_guard(_update_mutex);
+    auto current = _pruned_partitions.load(std::memory_order_acquire);
+    PrunedPartitions newly_pruned_partitions;
+    for (auto* filter : runtime_in_filters) {
+        const Expr* root = filter->root();
+        if (root->get_num_children() == 0 || !root->get_child(0)->is_slotref()) {
+            continue;
+        }
+        auto slot_boundaries = _boundaries.find(down_cast<const ColumnRef*>(root->get_child(0))->slot_id());
+        if (slot_boundaries == _boundaries.end()) {
+            continue;
+        }
+        ColumnPtr values;
+        bool matches_null = false;
+        if (!parse_join_runtime_in_filter(*root, &values, &matches_null)) {
+            continue;
+        }
+        for (const auto& boundary : slot_boundaries->second) {
+            // Preserve NULL partitions for null-safe joins.
+            if (boundary.contains_null && matches_null) {
+                continue;
+            }
+            bool match = false;
+            if (boundary.is_range()) {
+                // RANGE: does any IN value fall inside the partition interval?
+                for (size_t i = 0; i < values->size(); ++i) {
+                    if (values->is_null(i)) {
+                        continue;
+                    }
+                    if (boundary.lower_bound != nullptr && values->compare_at(i, 0, *boundary.lower_bound, -1) < 0) {
+                        continue;
+                    }
+                    if (boundary.upper_bound == nullptr) {
+                        match = true;
+                        break;
+                    }
+                    const int comparison = values->compare_at(i, 0, *boundary.upper_bound, -1);
+                    if (comparison < 0 || (comparison == 0 && boundary.upper_bound_closed)) {
+                        match = true;
+                        break;
+                    }
+                }
+            } else if (!boundary.list_values->empty()) {
+                // LIST: run the IN predicate itself over the partition value set.
+                Chunk chunk;
+                chunk.append_column(boundary.list_values, boundary.slot_id);
+                auto result = filter->evaluate(&chunk);
+                if (result.ok()) {
+                    ColumnViewer<TYPE_BOOLEAN> viewer(result.value());
+                    for (size_t i = 0; i < viewer.size(); ++i) {
+                        if (!viewer.is_null(i) && viewer.value(i)) {
+                            match = true;
+                            break;
+                        }
+                    }
+                } else {
+                    match = true;
+                }
+            }
+            if (!match) {
+                newly_pruned_partitions.insert(boundary.physical_partition_ids.begin(),
+                                               boundary.physical_partition_ids.end());
+            }
+        }
+    }
+    return publish_pruned_partitions(*current, newly_pruned_partitions);
+}
+
+int64_t RuntimeFilterPartitionPruner::prune_by_bloom_filters(RuntimeFilterProbeCollector& runtime_bloom_filters,
+                                                             RuntimeState* state) {
+    if (_bloom_pruning_complete.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    std::unique_lock<std::mutex> update_guard(_update_mutex, std::try_to_lock);
+    if (!update_guard.owns_lock() || _bloom_pruning_complete.load(std::memory_order_acquire)) {
+        return 0;
+    }
+
+    auto current = _pruned_partitions.load(std::memory_order_acquire);
+    PrunedPartitions newly_pruned_partitions;
+    for (const auto& entry : runtime_bloom_filters.descriptors()) {
+        const int32_t filter_id = entry.first;
+        const auto& descriptor = entry.second;
+        if (_processed_filter_ids.count(filter_id) != 0) {
+            continue;
+        }
+        SlotId slot_id;
+        if (descriptor->is_stream_build_filter() || !descriptor->can_push_down_runtime_filter() ||
+            !descriptor->is_probe_slot_ref(&slot_id)) {
+            _processed_filter_ids.emplace(filter_id);
+            continue;
+        }
+        auto slot_boundaries = _boundaries.find(slot_id);
+        if (slot_boundaries == _boundaries.end()) {
+            _processed_filter_ids.emplace(filter_id);
+            continue;
+        }
+        const RuntimeFilter* filter = descriptor->runtime_filter(0);
+        if (filter == nullptr) {
+            // The filter has not arrived yet.
+            continue;
+        }
+
+        if (filter->always_true()) {
+            _processed_filter_ids.emplace(filter_id);
+            continue;
+        }
+        for (const auto& boundary : slot_boundaries->second) {
+            const auto& ids = boundary.physical_partition_ids;
+            // Preserve NULL partitions for null-safe joins.
+            if (boundary.contains_null && filter->has_null()) {
+                continue;
+            }
+            bool match = true;
+            if (boundary.is_range()) {
+                match = type_dispatch_filter(boundary.column_type.type, true, [&]<LogicalType LT>() {
+                    const auto* min_max = down_cast<const MinMaxRuntimeFilter<LT>*>(filter->get_min_max_filter());
+                    if (min_max->is_empty_range()) {
+                        return false;
+                    }
+                    if (boundary.upper_bound != nullptr) {
+                        ColumnViewer<LT> upper(boundary.upper_bound);
+                        if (min_max->min() > upper.value(0) ||
+                            (min_max->min() == upper.value(0) && !boundary.upper_bound_closed)) {
+                            return false;
+                        }
+                    }
+                    if (boundary.lower_bound != nullptr) {
+                        ColumnViewer<LT> lower(boundary.lower_bound);
+                        if (min_max->max() < lower.value(0) ||
+                            (min_max->max() == lower.value(0) && !min_max->right_close_interval())) {
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+            } else {
+                // Global filters route each value to its hash partition.
+                RuntimeFilter::RunningContext context;
+                context.use_merged_selection = false;
+                context.compatibility = state->func_version() <= 3 || !state->enable_pipeline_engine();
+                context.selection.assign(boundary.list_values->size(), 1);
+                if (filter->num_hash_partitions() > 0) {
+                    context.exchange_hash_function_version = state->query_options().exchange_hash_function_version;
+                    filter->compute_partition_index(descriptor->layout(), {boundary.list_values.get()}, &context);
+                }
+                filter->evaluate(boundary.list_values.get(), &context);
+                match = std::any_of(context.selection.begin(), context.selection.end(),
+                                    [](uint8_t selected) { return selected != 0; });
+            }
+            if (!match) {
+                newly_pruned_partitions.insert(ids.begin(), ids.end());
+            }
+        }
+        _processed_filter_ids.emplace(filter_id);
+    }
+
+    const int64_t newly_pruned_count = publish_pruned_partitions(*current, newly_pruned_partitions);
+    if (_processed_filter_ids.size() == runtime_bloom_filters.descriptors().size()) {
+        // Publish completion only after the covered verdicts are visible.
+        _bloom_pruning_complete.store(true, std::memory_order_release);
+    }
+    return newly_pruned_count;
+}
 } // namespace starrocks

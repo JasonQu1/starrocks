@@ -87,6 +87,8 @@ public:
 
     ~ConnectorScanOperator() override = default;
 
+    void set_precondition_ready(RuntimeState* state) override;
+
     Status do_prepare(RuntimeState* state) override;
     void do_close(RuntimeState* state) override;
     ChunkSourcePtr create_chunk_source(MorselPtr morsel, int32_t chunk_source_index) override;
@@ -152,6 +154,7 @@ public:
 
     Status prepare(RuntimeState* state) override;
     void close(RuntimeState* state) override;
+    void update_runtime_filter_partition_pruning(RuntimeState* state) override;
     const std::string get_custom_coredump_msg() const override;
 
     bool reach_limit() override { return _limit != -1 && _reach_limit.load(); }

@@ -159,8 +159,35 @@ std::string LakeDataSource::name() const {
     return "LakeDataSource";
 }
 
+void LakeDataSource::update_runtime_filter_partition_pruning(RuntimeState* state, RuntimeProfile* driver_profile) {
+    auto* pruner = _provider->runtime_filter_partition_pruner();
+    if (_partition_pruned || pruner == nullptr) {
+        return;
+    }
+    // Counters are shared by all morsels of this driver.
+    if (_rf_partitions_pruned_counter == nullptr) {
+        auto* partitions_total_counter = ADD_COUNTER_SKIP_MERGE(driver_profile, "RuntimeFilterPartitionsTotal",
+                                                                TUnit::UNIT, TCounterMergeType::SKIP_ALL);
+        _rf_partitions_pruned_counter = ADD_COUNTER(driver_profile, "RuntimeFilterPartitionsPruned", TUnit::UNIT);
+        _rf_pruned_scan_tasks_counter = ADD_COUNTER(driver_profile, "RuntimeFilterPrunedScanTasks", TUnit::UNIT);
+        COUNTER_SET(partitions_total_counter, pruner->candidate_partition_count());
+    }
+    const int64_t newly_pruned_count = pruner->prune_by_bloom_filters(*_runtime_filters, state);
+    if (newly_pruned_count > 0) {
+        COUNTER_UPDATE(_rf_partitions_pruned_counter, newly_pruned_count);
+    }
+    if (pruner->is_partition_pruned(_scan_range.partition_id)) {
+        COUNTER_UPDATE(_rf_pruned_scan_tasks_counter, 1);
+        _partition_pruned = true;
+    }
+}
+
 Status LakeDataSource::open(RuntimeState* state) {
     _runtime_state = state;
+    // EOF preserves normal task completion, including the final empty chunk.
+    if (_partition_pruned) {
+        return Status::EndOfFile("partition pruned by runtime filter");
+    }
     if (_needs_reopen) {
         _needs_reopen = false;
         auto runtime_filter_snapshots = capture_runtime_filter_snapshots();
@@ -269,6 +296,8 @@ bool LakeDataSource::can_reuse_with(pipeline::ScanMorsel& morsel) const {
 }
 
 Status LakeDataSource::reuse(RuntimeState* state, pipeline::ScanMorsel* morsel) {
+    // A reused data source serves a new morsel; clear the previous verdict.
+    _partition_pruned = false;
     if (morsel == nullptr || !can_reuse_with(*morsel)) {
         return Status::NotSupported("lake data source reuse is not supported");
     }
@@ -297,6 +326,10 @@ void LakeDataSource::release_for_reuse(RuntimeState* state) {
 }
 
 Status LakeDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
+    // Late filters can stop an already-open scan.
+    if (_partition_pruned) {
+        return Status::EndOfFile("partition pruned by runtime filter");
+    }
     ASSIGN_OR_RETURN(auto chunk_ptr, RuntimeChunkHelper::new_chunk_pooled_checked(_prj_iter->output_schema(),
                                                                                   _runtime_state->chunk_size()));
     chunk->reset(chunk_ptr);
@@ -1799,6 +1832,11 @@ DataSourcePtr LakeDataSourceProvider::create_data_source(const TScanRange& scan_
 }
 
 Status LakeDataSourceProvider::init(ObjectPool* pool, RuntimeState* state) {
+    if (_t_lake_scan_node.__isset.partition_boundaries) {
+        _rf_partition_pruner = std::make_shared<RuntimeFilterPartitionPruner>(
+                parse_partition_boundaries(state->desc_tbl().get_tuple_descriptor(_t_lake_scan_node.tuple_id),
+                                           _t_lake_scan_node.partition_boundaries, state));
+    }
     if (_tablet_manager == nullptr) {
         _tablet_manager = lake_tablet_manager();
     }

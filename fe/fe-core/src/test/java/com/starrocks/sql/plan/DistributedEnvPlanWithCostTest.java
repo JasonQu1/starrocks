@@ -33,7 +33,10 @@ import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.rule.transformation.DeriveRangeJoinPredicateRule;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.thrift.TExplainLevel;
+import com.starrocks.thrift.TExpr;
 import com.starrocks.thrift.TKeyRange;
+import com.starrocks.thrift.TPartitionBoundary;
+import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
@@ -54,6 +57,74 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         FeConstants.runningUnitTest = true;
         Config.tablet_sched_disable_colocate_overall_balance = true;
         connectContext.getSessionVariable().setEnableRewriteSimpleAggToMetaScan(false);
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_list (\n" +
+                "    id bigint,\n" +
+                "    dt varchar(20) not null,\n" +
+                "    province varchar(20) not null\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(id)\n" +
+                "PARTITION BY LIST (dt, province) (\n" +
+                "    PARTITION p1 VALUES IN ((\"2022-04-01\", \"beijing\"), " +
+                "(\"2022-04-01\", \"chongqing\")),\n" +
+                "    PARTITION p2 VALUES IN ((\"2022-04-02\", \"beijing\"))\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(id) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_range2 (\n" +
+                "    k1 int,\n" +
+                "    k2 int,\n" +
+                "    v bigint\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(k1)\n" +
+                "PARTITION BY RANGE(k1, k2) (\n" +
+                "    PARTITION p1 VALUES LESS THAN (\"10\", \"100\"),\n" +
+                "    PARTITION p2 VALUES LESS THAN (\"20\", \"100\")\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(k1) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_expr (\n" +
+                "    id bigint,\n" +
+                "    dt datetime not null\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(id)\n" +
+                "PARTITION BY date_trunc('day', dt)\n" +
+                "DISTRIBUTED BY HASH(id) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_range1 (\n" +
+                "    k int,\n" +
+                "    v bigint\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(k)\n" +
+                "PARTITION BY RANGE(k) (\n" +
+                "    PARTITION p1 VALUES LESS THAN (\"10\"),\n" +
+                "    PARTITION p2 VALUES LESS THAN (\"20\"),\n" +
+                "    PARTITION p3 VALUES LESS THAN (\"30\")\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(k) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_list_null (\n" +
+                "    id bigint,\n" +
+                "    city varchar(20)\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(id)\n" +
+                "PARTITION BY LIST (city) (\n" +
+                "    PARTITION pnull VALUES IN (NULL),\n" +
+                "    PARTITION pbj VALUES IN (\"beijing\"),\n" +
+                "    PARTITION psh VALUES IN (\"shanghai\", \"shenzhen\")\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(id) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
+        starRocksAssert.withTable("CREATE TABLE rf_partition_prune_list_mixnull (\n" +
+                "    id bigint,\n" +
+                "    city varchar(20)\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(id)\n" +
+                "PARTITION BY LIST (city) (\n" +
+                "    PARTITION pmix VALUES IN (\"beijing\", NULL),\n" +
+                "    PARTITION psh VALUES IN (\"shanghai\")\n" +
+                ")\n" +
+                "DISTRIBUTED BY HASH(id) BUCKETS 1\n" +
+                "PROPERTIES(\"replication_num\" = \"1\")");
     }
 
     @AfterEach
@@ -1810,5 +1881,257 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         Assertions.assertEquals(19920101, keyRange.get(0).begin_key);
         Assertions.assertEquals(19930101, keyRange.get(0).end_key);
         Assertions.assertEquals(1, scanNodes.getPartitionConjuncts().size());
+    }
+
+    @Test
+    public void testRuntimeFilterPartitionBoundariesRequireSessionGate() throws Exception {
+        String sql = "select count(1) from lineitem_partition a join[broadcast] "
+                + "lineitem_partition_colocate b on a.L_SHIPDATE = b.L_SHIPDATE";
+
+        List<TPlanNode> disabledProbeScans = serializedOlapProbeScans(getExecPlan(sql));
+        Assertions.assertFalse(disabledProbeScans.isEmpty());
+        Assertions.assertTrue(disabledProbeScans.stream()
+                .noneMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()));
+
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            List<TPlanNode> enabledProbeScans = serializedOlapProbeScans(getExecPlan(sql));
+            Assertions.assertTrue(enabledProbeScans.stream().anyMatch(node ->
+                    node.getOlap_scan_node().isSetPartition_boundaries()
+                            && !node.getOlap_scan_node().getPartition_boundaries().isEmpty()
+                            && node.getOlap_scan_node().getPartition_boundaries().stream()
+                                    .allMatch(boundary -> boundary.getPhysical_partition_idsSize() > 0
+                                            && !boundary.isRange_upper_closed())));
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    @Test
+    public void testDictionaryEncodedPartitionBoundariesAreSkipped() throws Exception {
+        var session = connectContext.getSessionVariable();
+        boolean oldMockDict = FeConstants.USE_MOCK_DICT_MANAGER;
+        boolean oldLowCardinality = session.isEnableLowCardinalityOptimize();
+        boolean oldV2 = session.isUseLowCardinalityOptimizeV2();
+        boolean oldCteReuse = session.isCboCteReuse();
+        boolean oldPrune = session.isEnableRuntimeFilterPartitionPrune();
+        String sql = "select a.province, count(1) from rf_partition_prune_list a join[broadcast] "
+                + "rf_partition_prune_list b on a.province = b.province group by a.province";
+        try {
+            FeConstants.USE_MOCK_DICT_MANAGER = true;
+            session.setUseLowCardinalityOptimizeV2(true);
+            session.setCboCteReuse(false);
+            session.replayFromJson("{\"enable_runtime_filter_partition_prune\":true}");
+            session.setEnableLowCardinalityOptimize(false);
+            Assertions.assertTrue(serializedOlapProbeScans(getExecPlan(sql)).stream()
+                    .anyMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()));
+
+            session.setEnableLowCardinalityOptimize(true);
+            ExecPlan plan = getExecPlan(sql);
+            List<TPlanNode> scans = serializedOlapProbeScans(plan);
+            Assertions.assertFalse(scans.isEmpty());
+            // Ensure the regression really exercises an encoded probe slot.
+            Assertions.assertTrue(plan.getDescTbl().toThrift().getSlotDescriptors().stream()
+                    .anyMatch(slot -> "province".equals(slot.getColName())
+                            && slot.getSlotType().getTypes().get(0).getScalar_type().getType()
+                                    == com.starrocks.thrift.TPrimitiveType.INT));
+            Assertions.assertTrue(scans.stream()
+                    .noneMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()));
+        } finally {
+            FeConstants.USE_MOCK_DICT_MANAGER = oldMockDict;
+            session.setEnableLowCardinalityOptimize(oldLowCardinality);
+            session.setUseLowCardinalityOptimizeV2(oldV2);
+            session.setCboCteReuse(oldCteReuse);
+            session.replayFromJson("{\"enable_runtime_filter_partition_prune\":" + oldPrune + "}");
+        }
+    }
+
+    @Test
+    public void testListRuntimeFilterPartitionBoundaryLimitIsPerBoundary() throws Exception {
+        String sql = "select count(1) from rf_partition_prune_list a join[broadcast] "
+                + "rf_partition_prune_list b on a.dt = b.dt and a.province = b.province";
+
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true,"
+                            + "\"dynamic_partition_prune_limit\":1}");
+            List<TPartitionBoundary> boundaries =
+                    serializedOlapProbeScans(getExecPlan(sql)).stream()
+                            .filter(node -> node.getOlap_scan_node().isSetPartition_boundaries())
+                            .flatMap(node -> node.getOlap_scan_node()
+                                    .getPartition_boundaries().stream())
+                            .collect(Collectors.toList());
+
+            Assertions.assertFalse(boundaries.isEmpty());
+            // dt deduplicates to a single value per partition, so both partitions survive.
+            // province exceeds the limit inside p1 only: that one boundary is dropped and
+            // p2's province boundary still ships.
+            Assertions.assertTrue(boundaries.stream().allMatch(boundary ->
+                    boundary.getList_valuesSize() == 1
+                            && boundary.getPhysical_partition_idsSize() > 0));
+            List<Long> boundariesPerSlot = boundaries.stream()
+                    .collect(Collectors.groupingBy(
+                            TPartitionBoundary::getSlot_id,
+                            Collectors.counting()))
+                    .values().stream().sorted().collect(Collectors.toList());
+            Assertions.assertEquals(List.of(1L, 2L), boundariesPerSlot);
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false,"
+                            + "\"dynamic_partition_prune_limit\":4096}");
+        }
+    }
+
+    @Test
+    public void testMultiColumnRangeFirstColumnBoundary() throws Exception {
+        String firstColumnSql = "select count(1) from rf_partition_prune_range2 a join[broadcast] "
+                + "rf_partition_prune_range2 b on a.k1 = b.k1";
+        String trailingColumnSql = "select count(1) from rf_partition_prune_range2 a join[broadcast] "
+                + "rf_partition_prune_range2 b on a.k2 = b.k2";
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            List<TPartitionBoundary> boundaries =
+                    serializedOlapProbeScans(getExecPlan(firstColumnSql)).stream()
+                            .filter(node -> node.getOlap_scan_node().isSetPartition_boundaries())
+                            .flatMap(node -> node.getOlap_scan_node()
+                                    .getPartition_boundaries().stream())
+                            .collect(Collectors.toList());
+            // The first column is projected with a closed upper bound; the minimum
+            // partition carries contains_null.
+            Assertions.assertEquals(2, boundaries.size());
+            Assertions.assertTrue(boundaries.stream().allMatch(boundary ->
+                    boundary.isSetRange_upper() && boundary.isRange_upper_closed()
+                            && boundary.getPhysical_partition_idsSize() > 0));
+            Assertions.assertTrue(boundaries.stream().anyMatch(TPartitionBoundary::isContains_null));
+
+            // Trailing partition columns are not projectable.
+            Assertions.assertTrue(serializedOlapProbeScans(getExecPlan(trailingColumnSql)).stream()
+                    .noneMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()));
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    @Test
+    public void testExpressionPartitionBoundariesAreSkipped() throws Exception {
+        String sql = "select count(1) from rf_partition_prune_expr a join[broadcast] "
+                + "rf_partition_prune_expr b on a.dt = b.dt";
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            Assertions.assertTrue(serializedOlapProbeScans(getExecPlan(sql)).stream()
+                    .noneMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()));
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    @Test
+    public void testRangeBoundaryLiteralsAndNullPlacement() throws Exception {
+        String sql = "select count(1) from rf_partition_prune_range1 a join[broadcast] "
+                + "rf_partition_prune_range1 b on a.k = b.k";
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            List<TPartitionBoundary> boundaries = probeBoundaries(getExecPlan(sql));
+            // p1 = [MIN, 10) is the NULL home and ships no lower bound; the others ship the DDL literals.
+            List<String> shapes = boundaries.stream()
+                    .map(boundary -> (boundary.isSetRange_lower() ? intLiteral(boundary.getRange_lower()) : "MIN")
+                            + ".." + intLiteral(boundary.getRange_upper())
+                            + (boundary.isContains_null() ? "/null" : ""))
+                    .sorted().collect(Collectors.toList());
+            Assertions.assertEquals(List.of("10..20", "20..30", "MIN..10/null"), shapes);
+            Assertions.assertTrue(boundaries.stream().noneMatch(TPartitionBoundary::isRange_upper_closed));
+            Assertions.assertTrue(boundaries.stream().allMatch(boundary -> boundary.getPhysical_partition_idsSize() == 1));
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    @Test
+    public void testIneligibleProbeSlotsShipNoBoundaries() throws Exception {
+        // The join key is not a partition column.
+        String nonPartitionColumn = "select count(1) from rf_partition_prune_range1 a join[broadcast] "
+                + "rf_partition_prune_range1 b on a.v = b.v";
+        // The probe side is an expression over the partition column, not the bare slot.
+        String expressionProbe = "select count(1) from rf_partition_prune_range1 a join[broadcast] "
+                + "rf_partition_prune_range1 b on a.k + 1 = b.k";
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            for (String sql : List.of(nonPartitionColumn, expressionProbe)) {
+                List<TPlanNode> scans = serializedOlapProbeScans(getExecPlan(sql));
+                Assertions.assertFalse(scans.isEmpty(), sql);
+                Assertions.assertTrue(scans.stream()
+                        .noneMatch(node -> node.getOlap_scan_node().isSetPartition_boundaries()), sql);
+            }
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    @Test
+    public void testListNullPartitionShapes() throws Exception {
+        String nullOnlyEq = "select count(1) from rf_partition_prune_list_null a join[broadcast] "
+                + "rf_partition_prune_list_null b on a.city = b.city";
+        String nullOnlyNullSafe = "select count(1) from rf_partition_prune_list_null a join[broadcast] "
+                + "rf_partition_prune_list_null b on a.city <=> b.city";
+        String mixed = "select count(1) from rf_partition_prune_list_mixnull a join[broadcast] "
+                + "rf_partition_prune_list_mixnull b on a.city <=> b.city";
+        try {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":true}");
+            // `=` derives `city IS NOT NULL`, so the planner drops the NULL-only partition before the
+            // boundaries are built and it is never a candidate.
+            List<String> eqShapes = probeBoundaries(getExecPlan(nullOnlyEq)).stream()
+                    .map(DistributedEnvPlanWithCostTest::listShape).sorted().collect(Collectors.toList());
+            Assertions.assertEquals(List.of("beijing", "shanghai,shenzhen"), eqShapes);
+            // `<=>` keeps it: a NULL-only partition ships an empty value list with contains_null set.
+            List<String> nullSafeShapes = probeBoundaries(getExecPlan(nullOnlyNullSafe)).stream()
+                    .map(DistributedEnvPlanWithCostTest::listShape).sorted().collect(Collectors.toList());
+            Assertions.assertEquals(List.of("/null", "beijing", "shanghai,shenzhen"), nullSafeShapes);
+            // NULL is stripped out of a mixed value list and travels only in contains_null. `<=>` again, since
+            // the planner's static IS NOT NULL pruning also drops a partition that merely contains NULL.
+            List<String> mixedShapes = probeBoundaries(getExecPlan(mixed)).stream()
+                    .map(DistributedEnvPlanWithCostTest::listShape).sorted().collect(Collectors.toList());
+            Assertions.assertEquals(List.of("beijing/null", "shanghai"), mixedShapes);
+        } finally {
+            connectContext.getSessionVariable().replayFromJson(
+                    "{\"enable_runtime_filter_partition_prune\":false}");
+        }
+    }
+
+    private List<TPartitionBoundary> probeBoundaries(ExecPlan plan) {
+        return serializedOlapProbeScans(plan).stream()
+                .filter(node -> node.getOlap_scan_node().isSetPartition_boundaries())
+                .flatMap(node -> node.getOlap_scan_node().getPartition_boundaries().stream())
+                .collect(Collectors.toList());
+    }
+
+    private static String intLiteral(TExpr expr) {
+        return String.valueOf(expr.getNodes().get(0).getInt_literal().getValue());
+    }
+
+    private static String listShape(TPartitionBoundary boundary) {
+        String values = boundary.getList_valuesSize() == 0 ? "" : boundary.getList_values().stream()
+                .map(expr -> expr.getNodes().get(0).getString_literal().getValue())
+                .sorted().collect(Collectors.joining(","));
+        return values + (boundary.isContains_null() ? "/null" : "");
+    }
+
+    private List<TPlanNode> serializedOlapProbeScans(ExecPlan plan) {
+        return plan.getFragments().stream()
+                .flatMap(fragment -> fragment.toThrift().getPlan().getNodes().stream())
+                .filter(TPlanNode::isSetOlap_scan_node)
+                .filter(node -> node.isSetProbe_runtime_filters()
+                        && !node.getProbe_runtime_filters().isEmpty())
+                .collect(Collectors.toList());
     }
 }

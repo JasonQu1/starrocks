@@ -734,6 +734,12 @@ StarRocks offers two types of RF: Local RF and Global RF. Local RF is suitable f
 
 Default value: `true`, which means global RF is enabled. If this feature is disabled, global RF does not take effect. Local RF can still work.
 
+### enable_runtime_filter_partition_prune
+
+* **Description**: Whether Join runtime filters on partition columns can prune whole partitions on the BE.
+* **Default**: `false`
+* **Data type**: Boolean
+
 ### enable_group_by_compressed_key
 
 * **Description**: Whether to use accurate statistical information to compress the GROUP BY Key column. Valid values: `true` and `false`.

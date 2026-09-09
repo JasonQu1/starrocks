@@ -16,6 +16,8 @@
 
 #include <unordered_map>
 
+#include "common/runtime_profile.h"
+#include "compute_env/query/partition_scan_range_pruner.h"
 #include "compute_env/query/scan_conjuncts_manager.h"
 #include "connector_primitive/connector.h"
 #include "storage/lake/tablet_manager.h"
@@ -126,6 +128,8 @@ private:
     void remember_runtime_filter_snapshots(RuntimeFilterSnapshots snapshots);
     bool needs_late_runtime_filter_reinit(const RuntimeFilterSnapshots& current_snapshots) const;
 
+    void update_runtime_filter_partition_pruning(RuntimeState* state, RuntimeProfile* driver_profile) override;
+
     Status _extend_schema_by_access_paths();
     void _inherit_default_value_from_json(TabletColumn* column, const TabletColumn& root_column,
                                           const ColumnAccessPath* path);
@@ -135,6 +139,13 @@ private:
 private:
     const LakeDataSourceProvider* _provider;
     const TInternalScanRange _scan_range;
+
+    // Task-local state; access is serialized by scan-task handoff.
+    bool _partition_pruned = false;
+
+    // RF partition prune
+    RuntimeProfile::Counter* _rf_partitions_pruned_counter = nullptr;
+    RuntimeProfile::Counter* _rf_pruned_scan_tasks_counter = nullptr;
 
     Status _status = Status::OK();
     // The conjuncts couldn't push down to storage engine
@@ -377,6 +388,11 @@ public:
 
     int64_t get_splitted_scan_rows() const { return splitted_scan_rows; }
 
+    RuntimeFilterPartitionPruner* runtime_filter_partition_pruner() const { return _rf_partition_pruner.get(); }
+    int64_t prune_partitions_by_runtime_in_filters(const std::vector<ExprContext*>& runtime_in_filters) override {
+        return _rf_partition_pruner == nullptr ? 0 : _rf_partition_pruner->prune_by_in_filters(runtime_in_filters);
+    }
+
 protected:
     const int32_t _plan_node_id;
     const TLakeScanNode _t_lake_scan_node;
@@ -388,6 +404,9 @@ protected:
     bool _could_split_physically = false;
     bool _enable_lake_prepared_physical_split_scan = false;
     int64_t splitted_scan_rows = 0;
+
+    // A shared pointer keeps the provider copyable; the pruner itself holds a mutex.
+    std::shared_ptr<RuntimeFilterPartitionPruner> _rf_partition_pruner;
 
 private:
     StatusOr<bool> _could_tablet_internal_parallel(const std::vector<TScanRangeParams>& scan_ranges,

@@ -61,6 +61,12 @@ public:
     // the method `insert_local_exchange_operator` is true also.
     virtual bool accept_empty_scan_ranges() const { return true; }
 
+    // Apply shared runtime IN filters and return the number of newly pruned partitions.
+    // Providers own their pruning metadata and implementation; unsupported providers do nothing.
+    virtual int64_t prune_partitions_by_runtime_in_filters(const std::vector<ExprContext*>& runtime_in_filters) {
+        return 0;
+    }
+
     virtual Status init(ObjectPool* pool, RuntimeState* state) { return Status::OK(); }
 
     const std::vector<ExprContext*>& partition_exprs() const { return _partition_exprs; }

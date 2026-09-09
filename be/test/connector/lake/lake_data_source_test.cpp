@@ -41,6 +41,8 @@
 #include "connector/lake/lake_global_late_materialization_context.h"
 #include "exec_primitive/pipeline/scan/scan_morsel.h"
 #include "exec_primitive/runtime_filter/runtime_filter_probe.h"
+#include "exprs/expr_factory.h"
+#include "exprs/in_const_predicate.hpp"
 #include "fs/fs_factory.h"
 #include "fs/fs_util.h"
 #include "runtime/descriptor_helper.h"
@@ -66,6 +68,7 @@
 #include "storage/rowset/short_key_range_option.h"
 #include "storage/tablet_schema.h"
 #include "storage_primitive/vector_search_option.h"
+#include "testutil/exprs_test_helper.h"
 
 namespace starrocks::lake {
 
@@ -1878,6 +1881,111 @@ TEST_F(LakeDataSourceTest, no_glm_context_when_late_materialization_disabled) {
 
     // get_ctx() DCHECKs on an unknown scan node id, so assert on the map itself.
     EXPECT_TRUE(glm_mgr._ctx_map.empty());
+}
+
+// A runtime-filter pruned scan task never builds a reader: open() returns EOF before any
+// tablet reader work. close() must tolerate that, otherwise the pruning path crashes.
+TEST_F(LakeDataSourceTest, close_without_reader_is_safe) {
+    auto runtime_state = std::make_shared<RuntimeState>();
+    TPlanNode plan_node;
+    plan_node.__set_node_id(1);
+    TLakeScanNode lake_scan_node;
+    lake_scan_node.__set_tuple_id(0);
+    plan_node.__set_lake_scan_node(lake_scan_node);
+
+    starrocks::connector::LakeDataSourceProvider provider(plan_node);
+    provider.set_lake_tablet_manager(_tablet_mgr);
+
+    TInternalScanRange internal_scan_range;
+    internal_scan_range.__set_tablet_id(_tablet_metadata->id());
+    internal_scan_range.__set_version(std::to_string(_tablet_metadata->version()));
+    TScanRange scan_range;
+    scan_range.__set_internal_scan_range(internal_scan_range);
+
+    starrocks::connector::LakeDataSource ds(&provider, scan_range);
+    RuntimeProfile parent_profile("LakeDataSourceCloseTest");
+    ds.set_runtime_profile(&parent_profile);
+    // Never opened, so no reader, no projection iterator: closing must not dereference them.
+    ds.close(runtime_state.get());
+}
+
+TEST_F(LakeDataSourceTest, provider_in_pruning_skips_morsels_before_open) {
+    auto state = create_runtime_state_for_test();
+    TDescriptorTableBuilder descriptor_builder;
+    TTupleDescriptorBuilder tuple_builder;
+    tuple_builder.add_slot(TSlotDescriptorBuilder().type(TYPE_INT).column_name("p").build());
+    tuple_builder.build(&descriptor_builder);
+    DescriptorTbl* descriptor_table = nullptr;
+    ASSERT_OK(DescriptorTbl::create(state.get(), state->obj_pool(), descriptor_builder.desc_tbl(), &descriptor_table,
+                                    4096));
+    state->set_desc_tbl(descriptor_table);
+    auto* tuple = descriptor_table->get_tuple_descriptor(0);
+    auto slot_id = tuple->slots()[0]->id();
+    auto int_literal = [](int value) {
+        TExprNode node;
+        node.__set_node_type(TExprNodeType::INT_LITERAL);
+        node.__set_type(TypeDescriptor(TYPE_INT).to_thrift());
+        node.__set_num_children(0);
+        TIntLiteral literal;
+        literal.__set_value(value);
+        node.__set_int_literal(literal);
+        TExpr expr;
+        expr.nodes.emplace_back(std::move(node));
+        return expr;
+    };
+    TPartitionBoundary boundary;
+    boundary.__set_slot_id(slot_id);
+    boundary.__set_physical_partition_ids({10, 11});
+    boundary.__set_list_values({int_literal(2)});
+    TLakeScanNode scan_node;
+    scan_node.__set_tuple_id(tuple->id());
+    scan_node.__set_partition_boundaries({boundary});
+    TPlanNode plan_node;
+    plan_node.__set_node_id(0);
+    plan_node.__set_lake_scan_node(scan_node);
+    connector::LakeDataSourceProvider provider(plan_node);
+    provider.set_lake_tablet_manager(_tablet_mgr);
+    ASSERT_OK(provider.init(state->obj_pool(), state.get()));
+
+    TExprNode predicate;
+    predicate.__set_node_type(TExprNodeType::IN_PRED);
+    predicate.__set_opcode(TExprOpcode::FILTER_IN);
+    predicate.__set_child_type(TPrimitiveType::INT);
+    predicate.__set_type(TypeDescriptor(TYPE_BOOLEAN).to_thrift());
+    predicate.__set_num_children(2);
+    TInPredicate in_predicate;
+    in_predicate.__set_is_not_in(false);
+    predicate.__set_in_predicate(in_predicate);
+    TExpr expression;
+    expression.nodes = {predicate, ExprsTestHelper::create_column_ref_t_expr<TYPE_INT>(slot_id, false).nodes[0],
+                        int_literal(7).nodes[0]};
+    ExprContext* in_filter = nullptr;
+    ASSERT_OK(ExprFactory::create_expr_tree(state->obj_pool(), expression, &in_filter, state.get()));
+    DeferOp close_filter([&] { in_filter->close(state.get()); });
+    ASSERT_OK(in_filter->prepare(state.get()));
+    ASSERT_OK(in_filter->open(state.get()));
+    down_cast<VectorizedInConstPredicate<TYPE_INT>*>(in_filter->root())->set_is_join_runtime_filter(true);
+
+    // Exercise the primitive provider interface used by ConnectorScanOperator.
+    connector::DataSourceProvider& base_provider = provider;
+    EXPECT_EQ(2, base_provider.prune_partitions_by_runtime_in_filters({in_filter}));
+    EXPECT_EQ(0, base_provider.prune_partitions_by_runtime_in_filters({in_filter}));
+    RuntimeFilterProbeCollector collector;
+    RuntimeProfile profile("partition pruning");
+    for (int64_t partition_id : {10, 11}) {
+        TInternalScanRange internal;
+        internal.__set_partition_id(partition_id);
+        TScanRange scan_range;
+        scan_range.__set_internal_scan_range(internal);
+        auto source = base_provider.create_data_source(scan_range);
+        source->set_runtime_filters(&collector);
+        source->update_runtime_filter_partition_pruning(state.get(), &profile);
+        source->update_runtime_filter_partition_pruning(state.get(), &profile);
+        EXPECT_TRUE(source->open(state.get()).is_end_of_file());
+        source->close(state.get());
+    }
+    EXPECT_EQ(2, profile.get_counter("RuntimeFilterPartitionsTotal")->value());
+    EXPECT_EQ(2, profile.get_counter("RuntimeFilterPrunedScanTasks")->value());
 }
 
 } // namespace starrocks::lake

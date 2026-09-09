@@ -14,6 +14,8 @@
 
 #include "exec/pipeline/scan/olap_scan_operator.h"
 
+#include "base/testutil/assert.h"
+#include "column/column_helper.h"
 #include "common/util/table_metrics.h"
 #include "compute_env/global_dict/fragment_dict_state.h"
 #include "compute_env/query/fragment_runtime_state.h"
@@ -23,7 +25,10 @@
 #include "exec/pipeline/scan/olap_chunk_source.h"
 #include "exec/pipeline/scan/olap_scan_prepare_operator.h"
 #include "exec_primitive/pipeline/scan/scan_morsel.h"
+#include "exprs/column_ref.h"
+#include "exprs/in_const_predicate.hpp"
 #include "gtest/gtest.h"
+#include "runtime/descriptor_helper.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
 #include "storage/query/olap_fixed_morsel_queue.h"
@@ -237,6 +242,134 @@ TEST_F(OlapScanOperatorTest, sample_counters_report_their_own_statistic) {
     expect_sample_counter(profile, "SamplePopulationSize", TUnit::UNIT, 444);
     expect_sample_counter(profile, "SampleBuildHistogramCount", TUnit::UNIT, 555);
 
+    scan_node.close(&_runtime_state);
+}
+
+
+namespace {
+
+TExpr make_int_literal(int32_t value) {
+    TExprNode node;
+    node.__set_node_type(TExprNodeType::INT_LITERAL);
+    node.__set_type(TypeDescriptor(TYPE_INT).to_thrift());
+    node.__set_num_children(0);
+    TIntLiteral literal;
+    literal.__set_value(value);
+    node.__set_int_literal(literal);
+    TExpr expr;
+    expr.nodes.emplace_back(std::move(node));
+    return expr;
+}
+
+TPartitionBoundary make_range_boundary(TSlotId slot_id, int64_t physical_id, int32_t lower, int32_t upper) {
+    TPartitionBoundary boundary;
+    boundary.__set_physical_partition_ids({physical_id});
+    boundary.__set_slot_id(slot_id);
+    boundary.__set_range_lower(make_int_literal(lower));
+    boundary.__set_range_upper(make_int_literal(upper));
+    return boundary;
+}
+
+// A join runtime IN filter `slot IN (value)` built the way HashJoiner builds it.
+ExprContext* make_runtime_in_filter(RuntimeState* state, TSlotId slot_id, int32_t value) {
+    auto* pool = state->obj_pool();
+    auto column = ColumnHelper::create_column(TypeDescriptor(TYPE_INT), true);
+    column->append_datum(Datum(value));
+    VectorizedInConstPredicateBuilder builder(state, pool, pool->add(new ColumnRef(TypeDescriptor(TYPE_INT), slot_id)));
+    builder.use_as_join_runtime_filter();
+    CHECK_OK(builder.create());
+    builder.add_values(column, 0);
+    ExprContext* filter = builder.get_in_const_predicate();
+    CHECK_OK(filter->prepare(state));
+    CHECK_OK(filter->open(state));
+    return filter;
+}
+
+void expect_counter(RuntimeProfile* profile, const char* name, int64_t value) {
+    auto* counter = profile->get_counter(name);
+    ASSERT_NE(counter, nullptr) << name;
+    EXPECT_EQ(counter->value(), value) << name;
+}
+
+} // namespace
+
+// A chunk source whose partition was pruned by a runtime filter must never open the tablet reader: prepare()
+// returns before _init_olap_reader, _read_chunk reports EOF, and the reader-based hooks tolerate the missing
+// reader. A chunk source on a surviving partition passes the checkpoint untouched.
+TEST_F(OlapScanOperatorTest, runtime_filter_pruned_chunk_source_skips_reader) {
+    // One INT slot so the partition boundary can resolve its slot, then rebuild the descriptor table.
+    const TSlotId slot_id = 7;
+    TSlotDescriptor slot =
+            TSlotDescriptorBuilder().type(TYPE_INT).column_name("p").column_pos(0).nullable(true).id(slot_id).build();
+    slot.__set_parent(1);
+    _thrift_tbl.slotDescriptors.emplace_back(slot);
+    // The fixture assigns tableId without the isset flag, so the tuple is not linked to its table;
+    // OlapChunkSource::prepare reads the table name through that link.
+    _thrift_tbl.tupleDescriptors[0].__set_tableId(1);
+    ASSERT_TRUE(DescriptorTbl::create(&_runtime_state, &_object_pool, _thrift_tbl, &_tbl, _chunk_size).ok());
+    _runtime_state.set_desc_tbl(_tbl);
+
+    _tnode.olap_scan_node.__set_tuple_id(1);
+    _tnode.olap_scan_node.__set_partition_boundaries(
+            {make_range_boundary(slot_id, 100, 10, 20), make_range_boundary(slot_id, 200, 20, 30)});
+
+    OlapScanNode scan_node(&_object_pool, _tnode, *_tbl);
+    ASSERT_TRUE(scan_node.init(_tnode, &_runtime_state).ok());
+    auto* pruner = scan_node.runtime_filter_partition_pruner();
+    ASSERT_NE(pruner, nullptr);
+    ASSERT_EQ(pruner->candidate_partition_count(), 2);
+
+    // p IN (25) only intersects [20, 30): partition 100 is pruned.
+    ExprContext* in_filter = make_runtime_in_filter(&_runtime_state, slot_id, 25);
+    ASSERT_EQ(pruner->prune_by_in_filters({in_filter}), 1);
+    ASSERT_TRUE(pruner->is_partition_pruned(100));
+    ASSERT_FALSE(pruner->is_partition_pruned(200));
+
+    auto scan_ctx_factory =
+            std::make_shared<OlapScanContextFactory>(&scan_node, 1, false, false, std::move(_chunk_buffer_limiter));
+    OlapScanOperatorFactory scan_operator_factory(1, &scan_node, scan_ctx_factory);
+    // The bloom checkpoint reads the factory's probe collector, which decompose_to_pipeline always installs.
+    auto rf_probe_collector = std::make_shared<RcRfProbeCollector>(1, RuntimeFilterProbeCollector());
+    scan_operator_factory.init_runtime_filter(nullptr, {1}, LocalRFWaitingSet(), scan_node.record_desc(),
+                                              rf_probe_collector, {}, {});
+    auto scan_operator = std::make_shared<OlapScanOperator>(&scan_operator_factory, 1, 0, 1, &scan_node,
+                                                            scan_ctx_factory->get_or_create(0));
+
+    auto create_chunk_source = [&](int64_t partition_id) {
+        TInternalScanRange internal_range;
+        internal_range.__set_partition_id(partition_id);
+        TScanRange scan_range;
+        scan_range.__set_internal_scan_range(internal_range);
+        return scan_operator->create_chunk_source(std::make_unique<ScanMorsel>(1, scan_range), 0);
+    };
+
+    // Pruned partition: the real prepare() finishes without a tablet because the reader is never opened.
+    auto pruned = create_chunk_source(100);
+    auto* pruned_source = down_cast<OlapChunkSource*>(pruned.get());
+    ASSERT_TRUE(pruned_source->prepare(&_runtime_state).ok());
+    EXPECT_TRUE(pruned_source->_partition_pruned);
+    EXPECT_EQ(pruned_source->_reader, nullptr);
+    ChunkPtr chunk;
+    EXPECT_TRUE(pruned_source->_read_chunk(&_runtime_state, &chunk).is_end_of_file());
+    pruned_source->update_chunk_exec_stats(&_runtime_state);
+    pruned_source->close(&_runtime_state);
+
+    // Surviving partition: the checkpoint leaves it to the reader (stop before prepare(), which needs a tablet).
+    auto kept = create_chunk_source(200);
+    auto* kept_source = down_cast<OlapChunkSource*>(kept.get());
+    ASSERT_TRUE(kept_source->ChunkSource::prepare(&_runtime_state).ok());
+    kept_source->_runtime_state = &_runtime_state;
+    kept_source->_init_counter(&_runtime_state);
+    kept_source->update_runtime_filter_partition_pruning(&_runtime_state);
+    EXPECT_FALSE(kept_source->_partition_pruned);
+
+    // IN-filter pruning is accounted by the operator's precondition step, so only the task counter moves here.
+    auto* profile = scan_operator->unique_metrics();
+    expect_counter(profile, "RuntimeFilterPartitionsTotal", 2);
+    expect_counter(profile, "RuntimeFilterPartitionsPruned", 0);
+    expect_counter(profile, "RuntimeFilterPrunedScanTasks", 1);
+
+    in_filter->close(&_runtime_state);
     scan_node.close(&_runtime_state);
 }
 

@@ -23,6 +23,7 @@
 #include "column/chunk.h"
 #include "column/column_access_path.h"
 #include "common/statusor.h"
+#include "compute_env/query/partition_scan_range_pruner.h"
 #include "compute_env/query/scan_conjuncts_manager.h"
 #include "exec/scan_node.h"
 #include "exec/tablet_scanner.h"
@@ -104,6 +105,8 @@ public:
     std::optional<bool> partition_order_hint() const override { return _partition_order_hint; }
 
     const std::vector<ExprContext*>& bucket_exprs() const { return _bucket_exprs; }
+
+    RuntimeFilterPartitionPruner* runtime_filter_partition_pruner() { return _runtime_filter_partition_pruner.get(); }
 
 private:
     friend class TabletScanner;
@@ -212,6 +215,8 @@ private:
     std::vector<ExprContext*> _bucket_exprs;
 
     std::vector<ExprContext*> _partition_exprs;
+
+    std::unique_ptr<RuntimeFilterPartitionPruner> _runtime_filter_partition_pruner;
 
     // profile
     RuntimeProfile* _scan_profile = nullptr;

@@ -615,6 +615,12 @@ StarRocks は 2 種類の RF を提供します：ローカル RF とグロー�
 
 デフォルト値: `true`、つまりグローバル RF が有効です。この機能が無効になっている場合、グローバル RF は効果を発揮しません。ローカル RF は引き続き機能します。
 
+### enable_runtime_filter_partition_prune
+
+* **説明**: パーティション列の Join ランタイムフィルターによる、BE 側でのパーティション全体のプルーニングを有効にします。
+* **デフォルト**: `false`
+* **データ型**: Boolean
+
 ### enable_group_by_compressed_key
 
 * **説明**: GROUP BY キー列を圧縮するために正確な統計情報を使用するかどうか。有効な値: `true` と `false`。

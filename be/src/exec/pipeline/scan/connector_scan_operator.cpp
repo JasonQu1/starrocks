@@ -665,6 +665,21 @@ int ConnectorScanOperator::available_pickup_morsel_count() {
     return io_tasks;
 }
 
+void ConnectorScanOperator::set_precondition_ready(RuntimeState* state) {
+    ScanOperator::set_precondition_ready(state);
+    // The IN filters are shared per scan node: driver 0 judges them for everyone.
+    if (_driver_sequence != 0) {
+        return;
+    }
+    auto* provider = down_cast<ConnectorScanNode*>(_scan_node)->data_source_provider();
+    const int64_t newly_pruned_count =
+            provider->prune_partitions_by_runtime_in_filters(get_factory()->get_runtime_in_filters());
+    if (newly_pruned_count > 0) {
+        auto* pruned_counter = ADD_COUNTER(unique_metrics(), "RuntimeFilterPartitionsPruned", TUnit::UNIT);
+        COUNTER_UPDATE(pruned_counter, newly_pruned_count);
+    }
+}
+
 std::string ConnectorScanOperator::get_name() const {
     std::string finished = is_finished() ? "X" : "O";
     bool full = is_buffer_full();
@@ -790,7 +805,12 @@ Status ConnectorChunkSource::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(ChunkSource::prepare(state));
     _runtime_state = state;
     RETURN_IF_ERROR(_data_source->parse_runtime_filters(state));
+    update_runtime_filter_partition_pruning(state);
     return Status::OK();
+}
+
+void ConnectorChunkSource::update_runtime_filter_partition_pruning(RuntimeState* state) {
+    _data_source->update_runtime_filter_partition_pruning(state, _scan_op->unique_metrics());
 }
 
 bool ConnectorChunkSource::has_reusable_state() const {
@@ -808,7 +828,9 @@ Status ConnectorChunkSource::reuse(RuntimeState* state, MorselPtr&& morsel) {
     }
 
     _reset_reuse_state(state, std::move(morsel));
-    return _data_source->reuse(state, _morsel.get());
+    RETURN_IF_ERROR(_data_source->reuse(state, _morsel.get()));
+    update_runtime_filter_partition_pruning(state);
+    return Status::OK();
 }
 
 void ConnectorChunkSource::_reset_reuse_state(RuntimeState* state, MorselPtr&& morsel) {

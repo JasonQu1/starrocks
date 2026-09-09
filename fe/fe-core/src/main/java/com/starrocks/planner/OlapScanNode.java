@@ -103,6 +103,7 @@ import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TNormalOlapScanNode;
 import com.starrocks.thrift.TNormalPlanNode;
 import com.starrocks.thrift.TOlapScanNode;
+import com.starrocks.thrift.TPartitionBoundary;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeCommon;
 import com.starrocks.thrift.TPlanNodeType;
@@ -1194,6 +1195,12 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
         }
 
         assignOrderByHints(keyColumnNames);
+        Map<SlotRef, Integer> runtimeFilterProbeSlots = collectRuntimeFilterProbeSlots();
+        List<TPartitionBoundary> partitionBoundaries =
+                RuntimeFilterPartitionBoundaryBuilder.build(
+                        olapTable, selectedPartitionIds, runtimeFilterProbeSlots,
+                        ConnectContext.get().getSessionVariable().getDynamicPartitionPruneValuesLimit());
+
         if (olapTable.isCloudNativeTableOrMaterializedView()) {
             msg.node_type = TPlanNodeType.LAKE_SCAN_NODE;
             msg.lake_scan_node =
@@ -1264,6 +1271,9 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
             msg.lake_scan_node.setSchema_key(getSchemaKey());
 
             msg.lake_scan_node.setPartition_conjuncts(ExprToThrift.treesToThrift(partitionConjuncts));
+            if (!partitionBoundaries.isEmpty()) {
+                msg.lake_scan_node.setPartition_boundaries(partitionBoundaries);
+            }
         } else { // If you find yourself changing this code block, see also the above code block
             msg.node_type = TPlanNodeType.OLAP_SCAN_NODE;
             msg.olap_scan_node =
@@ -1334,6 +1344,9 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
                 sample.toThrift(sampleOptions);
             }
             msg.olap_scan_node.setPartition_conjuncts(ExprToThrift.treesToThrift(partitionConjuncts));
+            if (!partitionBoundaries.isEmpty()) {
+                msg.olap_scan_node.setPartition_boundaries(partitionBoundaries);
+            }
         }
     }
 
@@ -1919,5 +1932,41 @@ public class OlapScanNode extends AbstractOlapTableScanNode {
             }
         }
         return accept;
+    }
+
+    private Map<SlotRef, Integer> collectRuntimeFilterProbeSlots() {
+        Map<SlotRef, Integer> probeSlots = Maps.newLinkedHashMap();
+        if (!ConnectContext.get().getSessionVariable().isEnableRuntimeFilterPartitionPrune()) {
+            return probeSlots;
+        }
+        PartitionInfo partitionInfo = olapTable.getPartitionInfo();
+        if (partitionInfo instanceof ExpressionRangePartitionInfo
+                || partitionInfo instanceof ExpressionRangePartitionInfoV2) {
+            return probeSlots;
+        }
+        List<Column> partitionColumns = partitionInfo.getPartitionColumns(olapTable.getIdToColumn());
+        List<ColumnId> partitionColumnIds = partitionColumns.stream().map(Column::getColumnId).toList();
+        for (RuntimeFilterDescription description : probeRuntimeFilters) {
+            if (description.runtimeFilterType() != RuntimeFilterDescription.RuntimeFilterType.JOIN_FILTER) {
+                continue;
+            }
+            Expr probeExpr = description.getNodeIdToProbeExpr().get(getId().asInt());
+            if (!(probeExpr instanceof SlotRef slotRef) || slotRef.getColumn() == null) {
+                continue;
+            }
+            int columnIndex = partitionColumnIds.indexOf(slotRef.getColumn().getColumnId());
+            if (columnIndex < 0) {
+                continue;
+            }
+            if (partitionInfo instanceof RangePartitionInfo && columnIndex != 0) {
+                continue;
+            }
+            // Dictionary-encoded slots cannot compare raw partition literals.
+            if (!partitionColumns.get(columnIndex).getType().matchesType(slotRef.getType())) {
+                continue;
+            }
+            probeSlots.put(slotRef, columnIndex);
+        }
+        return probeSlots;
     }
 }

@@ -726,6 +726,19 @@ struct TTableSampleOptions {
   5: optional double probability_percent_v2; // new field; can carry sub-1% values such as 0.5, takes precedence when set
 }
 
+// One partition column's domain and physical IDs. LIST uses list_values; RANGE needs at least one bound.
+struct TPartitionBoundary {
+  1: optional list<i64> physical_partition_ids
+  2: optional Types.TSlotId slot_id
+  3: optional list<Exprs.TExpr> list_values // NULL is expressed via contains_null
+  4: optional Exprs.TExpr range_lower       // inclusive; absent means unbounded
+  5: optional Exprs.TExpr range_upper       // exclusive unless range_upper_closed
+  // Whether the partition definition routes NULL here, not a data statistic.
+  6: optional bool contains_null = false
+  // Multi-column RANGE projection includes the upper endpoint of its first column.
+  7: optional bool range_upper_closed = false
+}
+
 // Extension point for TOlapScanNode. DO NOT MODIFY: do not add fields here,
 // and do not rename, renumber or remove it. The field numbers inside are
 // allocated separately, so anything added here collides with them, and
@@ -786,6 +799,7 @@ struct TOlapScanNode {
 
   57: optional list<Exprs.TExpr> partition_conjuncts
   59: optional TOlapScanNodeExt ext
+  60: optional list<TPartitionBoundary> partition_boundaries
 }
 
 struct TJDBCScanNode {
@@ -857,6 +871,7 @@ struct TLakeScanNode {
 
   63: optional TTableSampleOptions sample_options
   64: optional TLakeScanNodeExt ext
+  65: optional list<TPartitionBoundary> partition_boundaries
 }
 
 struct TEqJoinCondition {
